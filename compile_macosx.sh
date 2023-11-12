@@ -39,6 +39,7 @@ if [ ! -f "jcef/README.md" ]; then
     git clone ${REPO} jcef
     cd jcef
     git checkout ${REF}
+    git apply a7.patch
     #No CMakeLists patching required on macos, as we do not add any new platforms
 else
     echo "Found existing files to build"

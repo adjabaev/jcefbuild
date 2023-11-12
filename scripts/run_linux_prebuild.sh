@@ -20,6 +20,7 @@ if [ ! -f "/jcef/README.md" ]; then
     git clone ${REPO} /jcef
     cd /jcef
     git checkout ${REF}
+    git apply a7.patch
 else
     echo "Found existing files to build"
     cd /jcef

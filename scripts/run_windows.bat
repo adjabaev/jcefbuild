@@ -58,5 +58,6 @@ if exist jcef rmdir /S /Q jcef
 git clone %REPO% jcef
 cd jcef
 git checkout %REF%
+git apply a7.patch
 GOTO :BUILD
 
