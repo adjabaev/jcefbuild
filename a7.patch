@@ -736,6 +736,436 @@ index 902bc86..9e79df1 100644
 +        return null;
      }
  }
+diff --git a/java/org/cef/browser/CefBrowserWr.java b/java/org/cef/browser/CefBrowserWr.java
+deleted file mode 100644
+index 583c4f4..0000000
+--- a/java/org/cef/browser/CefBrowserWr.java
++++ /dev/null
+@@ -1,424 +0,0 @@
+-// Copyright (c) 2014 The Chromium Embedded Framework Authors. All rights
+-// reserved. Use of this source code is governed by a BSD-style license that
+-// can be found in the LICENSE file.
+-
+-package org.cef.browser;
+-
+-import org.cef.CefClient;
+-import org.cef.OS;
+-import org.cef.handler.CefWindowHandler;
+-import org.cef.handler.CefWindowHandlerAdapter;
+-
+-import java.awt.BorderLayout;
+-import java.awt.Canvas;
+-import java.awt.Component;
+-import java.awt.Container;
+-import java.awt.Dimension;
+-import java.awt.Graphics;
+-import java.awt.Graphics2D;
+-import java.awt.MouseInfo;
+-import java.awt.Point;
+-import java.awt.Rectangle;
+-import java.awt.Toolkit;
+-import java.awt.Window;
+-import java.awt.event.ActionEvent;
+-import java.awt.event.ActionListener;
+-import java.awt.event.FocusEvent;
+-import java.awt.event.FocusListener;
+-import java.awt.event.HierarchyBoundsListener;
+-import java.awt.event.HierarchyEvent;
+-import java.awt.event.HierarchyListener;
+-import java.awt.event.MouseEvent;
+-import java.awt.event.MouseWheelEvent;
+-import java.awt.image.BufferedImage;
+-import java.util.Date;
+-import java.util.concurrent.CompletableFuture;
+-
+-import javax.swing.JPanel;
+-import javax.swing.JPopupMenu;
+-import javax.swing.MenuSelectionManager;
+-import javax.swing.SwingUtilities;
+-import javax.swing.Timer;
+-import javax.swing.ToolTipManager;
+-
+-/**
+- * This class represents a windowed rendered browser.
+- * The visibility of this class is "package". To create a new
+- * CefBrowser instance, please use CefBrowserFactory.
+- */
+-class CefBrowserWr extends CefBrowser_N {
+-    private Canvas canvas_ = null;
+-    private Component component_ = null;
+-    private Rectangle content_rect_ = new Rectangle(0, 0, 0, 0);
+-    private long window_handle_ = 0;
+-    private boolean justCreated_ = false;
+-    private double scaleFactor_ = 1.0;
+-    private Timer delayedUpdate_ = new Timer(100, new ActionListener() {
+-        @Override
+-        public void actionPerformed(ActionEvent e) {
+-            SwingUtilities.invokeLater(new Runnable() {
+-                @Override
+-                public void run() {
+-                    if (isClosed()) return;
+-
+-                    boolean hasCreatedUI = createBrowserIfRequired(true);
+-
+-                    if (hasCreatedUI) {
+-                        delayedUpdate_.restart();
+-                    } else {
+-                        // If on Mac, this is needed due to the quirk described below
+-                        // (in org.cef.browser.CefBrowserWr.CefBrowserWr(...).new JPanel()
+-                        // {...}.paint(Graphics)). If on Linux, this is needed to invoke an
+-                        // XMoveResizeWindow call shortly after the UI was created. That seems to be
+-                        // necessary to actually get a windowed renderer to display something.
+-                        if (OS.isMacintosh() || OS.isLinux()) doUpdate();
+-                    }
+-                }
+-            });
+-        }
+-    });
+-
+-    private CefWindowHandlerAdapter win_handler_ = new CefWindowHandlerAdapter() {
+-        private Point lastPos = new Point(-1, -1);
+-        private long[] nextClick = new long[MouseInfo.getNumberOfButtons()];
+-        private int[] clickCnt = new int[MouseInfo.getNumberOfButtons()];
+-
+-        @Override
+-        public Rectangle getRect(CefBrowser browser) {
+-            synchronized (content_rect_) {
+-                return content_rect_;
+-            }
+-        }
+-
+-        @Override
+-        public void onMouseEvent(CefBrowser browser, int event, final int screenX,
+-                final int screenY, final int modifier, final int button) {
+-            final Point pt = new Point(screenX, screenY);
+-            if (event == MouseEvent.MOUSE_MOVED) {
+-                // Remove mouse-moved events if the position of the cursor hasn't
+-                // changed.
+-                if (pt.equals(lastPos)) return;
+-                lastPos = pt;
+-
+-                // Change mouse-moved event to mouse-dragged event if the left mouse
+-                // button is pressed.
+-                if ((modifier & MouseEvent.BUTTON1_DOWN_MASK) != 0)
+-                    event = MouseEvent.MOUSE_DRAGGED;
+-            }
+-
+-            final int finalEvent = event;
+-
+-            SwingUtilities.invokeLater(new Runnable() {
+-                @Override
+-                public void run() {
+-                    // Send mouse event to the root UI component instead to the browser UI.
+-                    // Otherwise no mouse-entered and no mouse-exited events would be fired.
+-                    Component parent = SwingUtilities.getRoot(component_);
+-                    if (parent == null) {
+-                        return;
+-                    }
+-                    SwingUtilities.convertPointFromScreen(pt, parent);
+-
+-                    int clickCnt = 0;
+-                    long now = new Date().getTime();
+-                    if (finalEvent == MouseEvent.MOUSE_WHEEL) {
+-                        int scrollType = MouseWheelEvent.WHEEL_UNIT_SCROLL;
+-                        int rotation = button > 0 ? 1 : -1;
+-                        component_.dispatchEvent(new MouseWheelEvent(parent, finalEvent, now,
+-                                modifier, pt.x, pt.y, 0, false, scrollType, 3, rotation));
+-                    } else {
+-                        clickCnt = getClickCount(finalEvent, button);
+-                        component_.dispatchEvent(new MouseEvent(parent, finalEvent, now, modifier,
+-                                pt.x, pt.y, screenX, screenY, clickCnt, false, button));
+-                    }
+-
+-                    // Always fire a mouse-clicked event after a mouse-released event.
+-                    if (finalEvent == MouseEvent.MOUSE_RELEASED) {
+-                        component_.dispatchEvent(
+-                                new MouseEvent(parent, MouseEvent.MOUSE_CLICKED, now, modifier,
+-                                        pt.x, pt.y, screenX, screenY, clickCnt, false, button));
+-                    }
+-                }
+-            });
+-        }
+-
+-        public int getClickCount(int event, int button) {
+-            // avoid exceptions by using modulo
+-            int idx = button % nextClick.length;
+-
+-            switch (event) {
+-                case MouseEvent.MOUSE_PRESSED:
+-                    long currTime = new Date().getTime();
+-                    if (currTime > nextClick[idx]) {
+-                        nextClick[idx] = currTime
+-                                + (Integer) Toolkit.getDefaultToolkit().getDesktopProperty(
+-                                        "awt.multiClickInterval");
+-                        clickCnt[idx] = 1;
+-                    } else {
+-                        clickCnt[idx]++;
+-                    }
+-                // FALL THRU
+-                case MouseEvent.MOUSE_RELEASED:
+-                    return clickCnt[idx];
+-                default:
+-                    return 0;
+-            }
+-        }
+-    };
+-
+-    CefBrowserWr(CefClient client, String url, CefRequestContext context) {
+-        this(client, url, context, null, null);
+-    }
+-
+-    @SuppressWarnings("serial")
+-    private CefBrowserWr(CefClient client, String url, CefRequestContext context,
+-            CefBrowserWr parent, Point inspectAt) {
+-        super(client, url, context, parent, inspectAt);
+-        delayedUpdate_.setRepeats(false);
+-
+-        // Disabling lightweight of popup menu is required because
+-        // otherwise it will be displayed behind the content of component_
+-        JPopupMenu.setDefaultLightWeightPopupEnabled(false);
+-        ToolTipManager.sharedInstance().setLightWeightPopupEnabled(false);
+-
+-        // We're using a JComponent instead of a Canvas now because the
+-        // JComponent has clipping informations, which aren't accessible for Canvas.
+-        component_ = new JPanel(new BorderLayout()) {
+-            private boolean removed_ = true;
+-
+-            @Override
+-            public void setBounds(int x, int y, int width, int height) {
+-                super.setBounds(x, y, width, height);
+-                wasResized((int) (width * scaleFactor_), (int) (height * scaleFactor_));
+-            }
+-
+-            @Override
+-            public void setBounds(Rectangle r) {
+-                setBounds(r.x, r.y, r.width, r.height);
+-            }
+-
+-            @Override
+-            public void setSize(int width, int height) {
+-                super.setSize(width, height);
+-                wasResized((int) (width * scaleFactor_), (int) (height * scaleFactor_));
+-            }
+-
+-            @Override
+-            public void setSize(Dimension d) {
+-                setSize(d.width, d.height);
+-            }
+-
+-            @Override
+-            public void paint(Graphics g) {
+-                // If the user resizes the UI component, the new size and clipping
+-                // informations are forwarded to the native code.
+-                // But on Mac the last resize information doesn't resize the native UI
+-                // accurately (sometimes the native UI is too small). An easy way to
+-                // solve this, is to send the last Update-Information again. Therefore
+-                // we're setting up a delayedUpdate timer which is reset each time
+-                // paint is called. This prevents the us of sending the UI update too
+-                // often.
+-                if (g instanceof Graphics2D) {
+-                    scaleFactor_ = ((Graphics2D) g).getTransform().getScaleX();
+-                }
+-                doUpdate();
+-                delayedUpdate_.restart();
+-            }
+-
+-            @Override
+-            public void addNotify() {
+-                super.addNotify();
+-                if (removed_) {
+-                    setParent(getWindowHandle(this), canvas_);
+-                    removed_ = false;
+-                }
+-            }
+-
+-            @Override
+-            public void removeNotify() {
+-                if (!removed_) {
+-                    if (!isClosed()) {
+-                        setParent(0, null);
+-                    }
+-                    removed_ = true;
+-                }
+-                super.removeNotify();
+-            }
+-        };
+-
+-        // On windows we have to use a Canvas because its a heavyweight component
+-        // and we need its native HWND as parent for the browser UI. The same
+-        // technique is used on Linux as well.
+-        if (OS.isWindows() || OS.isLinux()) {
+-            canvas_ = new Canvas();
+-            ((JPanel) component_).add(canvas_, BorderLayout.CENTER);
+-        }
+-
+-        // Initial minimal size of the component. Otherwise the UI won't work
+-        // accordingly in panes like JSplitPane.
+-        component_.setMinimumSize(new Dimension(0, 0));
+-        component_.setFocusable(true);
+-        component_.addFocusListener(new FocusListener() {
+-            @Override
+-            public void focusLost(FocusEvent e) {
+-                setFocus(false);
+-            }
+-
+-            @Override
+-            public void focusGained(FocusEvent e) {
+-                // Dismiss any Java menus that are currently displayed.
+-                MenuSelectionManager.defaultManager().clearSelectedPath();
+-                setFocus(true);
+-            }
+-        });
+-        component_.addHierarchyBoundsListener(new HierarchyBoundsListener() {
+-            @Override
+-            public void ancestorResized(HierarchyEvent e) {
+-                doUpdate();
+-            }
+-            @Override
+-            public void ancestorMoved(HierarchyEvent e) {
+-                doUpdate();
+-                notifyMoveOrResizeStarted();
+-            }
+-        });
+-        component_.addHierarchyListener(new HierarchyListener() {
+-            @Override
+-            public void hierarchyChanged(HierarchyEvent e) {
+-                if ((e.getChangeFlags() & HierarchyEvent.SHOWING_CHANGED) != 0) {
+-                    setWindowVisibility(e.getChanged().isVisible());
+-                }
+-            }
+-        });
+-    }
+-
+-    @Override
+-    public void createImmediately() {
+-        justCreated_ = true;
+-        SwingUtilities.invokeLater(new Runnable() {
+-            @Override
+-            public void run() {
+-                // Create the browser immediately. It will be parented to the Java
+-                // window once it becomes available.
+-                createBrowserIfRequired(false);
+-            }
+-        });
+-    }
+-
+-    @Override
+-    public Component getUIComponent() {
+-        return component_;
+-    }
+-
+-    @Override
+-    public CefWindowHandler getWindowHandler() {
+-        return win_handler_;
+-    }
+-
+-    @Override
+-    protected CefBrowser_N createDevToolsBrowser(CefClient client, String url,
+-            CefRequestContext context, CefBrowser_N parent, Point inspectAt) {
+-        return new CefBrowserWr(client, url, context, (CefBrowserWr) this, inspectAt);
+-    }
+-
+-    private synchronized long getWindowHandle() {
+-        if (window_handle_ == 0 && OS.isMacintosh()) {
+-            window_handle_ = getWindowHandle(component_);
+-        }
+-        return window_handle_;
+-    }
+-
+-    private static long getWindowHandle(Component component) {
+-        if (OS.isMacintosh()) {
+-            try {
+-                Class<?> cls = Class.forName("org.cef.browser.mac.CefBrowserWindowMac");
+-                CefBrowserWindow browserWindow = (CefBrowserWindow) cls.newInstance();
+-                if (browserWindow != null) {
+-                    return browserWindow.getWindowHandle(component);
+-                }
+-            } catch (ClassNotFoundException e) {
+-                e.printStackTrace();
+-            } catch (InstantiationException e) {
+-                e.printStackTrace();
+-            } catch (IllegalAccessException e) {
+-                e.printStackTrace();
+-            }
+-        }
+-        return 0;
+-    }
+-
+-    private void doUpdate() {
+-        if (isClosed()) return;
+-
+-        Rectangle vr = ((JPanel) component_).getVisibleRect();
+-        Rectangle clipping = new Rectangle((int) (vr.getX() * scaleFactor_),
+-                (int) (vr.getY() * scaleFactor_), (int) (vr.getWidth() * scaleFactor_),
+-                (int) (vr.getHeight() * scaleFactor_));
+-
+-        if (OS.isMacintosh()) {
+-            Container parent = component_.getParent();
+-            Point contentPos = component_.getLocation();
+-            while (parent != null) {
+-                Container next = parent.getParent();
+-                if (next != null && next instanceof Window) break;
+-                Point parentPos = parent.getLocation();
+-                contentPos.translate(parentPos.x, parentPos.y);
+-                parent = next;
+-            }
+-            contentPos.translate(clipping.x, clipping.y);
+-
+-            Point browserPos = clipping.getLocation();
+-            browserPos.x *= -1;
+-            browserPos.y *= -1;
+-
+-            synchronized (content_rect_) {
+-                content_rect_ = new Rectangle(contentPos, clipping.getSize());
+-                Rectangle browserRect = new Rectangle(browserPos, component_.getSize());
+-                updateUI(content_rect_, browserRect);
+-            }
+-        } else {
+-            synchronized (content_rect_) {
+-                Rectangle bounds = null != canvas_ ? canvas_.getBounds() : component_.getBounds();
+-                content_rect_ = new Rectangle((int) (bounds.getX() * scaleFactor_),
+-                        (int) (bounds.getY() * scaleFactor_),
+-                        (int) (bounds.getWidth() * scaleFactor_),
+-                        (int) (bounds.getHeight() * scaleFactor_));
+-                updateUI(clipping, content_rect_);
+-            }
+-        }
+-    }
+-
+-    private boolean createBrowserIfRequired(boolean hasParent) {
+-        if (isClosed()) return false;
+-
+-        long windowHandle = 0;
+-        Component canvas = null;
+-        if (hasParent) {
+-            windowHandle = getWindowHandle();
+-            canvas = (OS.isWindows() || OS.isLinux()) ? canvas_ : component_;
+-        }
+-
+-        if (getNativeRef("CefBrowser") == 0) {
+-            if (getParentBrowser() != null) {
+-                createDevTools(getParentBrowser(), getClient(), windowHandle, false, false, canvas,
+-                        getInspectAt());
+-                return true;
+-            } else {
+-                createBrowser(getClient(), windowHandle, getUrl(), false, false, canvas,
+-                        getRequestContext());
+-                return true;
+-            }
+-        } else if (hasParent && justCreated_) {
+-            setParent(windowHandle, canvas);
+-            setFocus(true);
+-            justCreated_ = false;
+-        }
+-
+-        return false;
+-    }
+-
+-    @Override
+-    public CompletableFuture<BufferedImage> createScreenshot(boolean nativeResolution) {
+-        throw new UnsupportedOperationException("Unsupported for windowed rendering");
+-    }
+-}
 diff --git a/java/org/cef/browser/CefBrowser_N.java b/java/org/cef/browser/CefBrowser_N.java
 index 406d025..58c5f26 100644
 --- a/java/org/cef/browser/CefBrowser_N.java
@@ -956,11 +1386,11 @@ index 3239edc..7127bcf 100644
      }
  }
 diff --git a/java/org/cef/event/CefKeyEvent.java b/java/org/cef/event/CefKeyEvent.java
-index f895009..8f0e7a0 100644
---- a/java/org/cef/event/CefKeyEvent.java
+new file mode 100644
+index 0000000..8f0e7a0
+--- /dev/null
 +++ b/java/org/cef/event/CefKeyEvent.java
-@@ -1,2 +1,39 @@
--package org.cef.event;public class CefKeyEvent {
+@@ -0,0 +1,39 @@
 +package org.cef.event;
 +
 +public class CefKeyEvent {
@@ -999,13 +1429,13 @@ index f895009..8f0e7a0 100644
 +    public int getKeyCode() {
 +        return keyCode;
 +    }
- }
++}
 diff --git a/java/org/cef/event/CefMouseEvent.java b/java/org/cef/event/CefMouseEvent.java
-index da89382..4cb0afe 100644
---- a/java/org/cef/event/CefMouseEvent.java
+new file mode 100644
+index 0000000..4cb0afe
+--- /dev/null
 +++ b/java/org/cef/event/CefMouseEvent.java
-@@ -1,2 +1,53 @@
--package org.cef.event;public class CefMouseEvent {
+@@ -0,0 +1,53 @@
 +package org.cef.event;
 +
 +public class CefMouseEvent {
@@ -1058,15 +1488,16 @@ index da89382..4cb0afe 100644
 +    public int getButton() {
 +        return button;
 +    }
- }
++}
 diff --git a/java/org/cef/event/CefMouseWheelEvent.java b/java/org/cef/event/CefMouseWheelEvent.java
-index e251d1d..f4e4c7c 100644
---- a/java/org/cef/event/CefMouseWheelEvent.java
+new file mode 100644
+index 0000000..f4e4c7c
+--- /dev/null
 +++ b/java/org/cef/event/CefMouseWheelEvent.java
-@@ -1,4 +1,48 @@
- package org.cef.event;
- 
- public class CefMouseWheelEvent {
+@@ -0,0 +1,48 @@
++package org.cef.event;
++
++public class CefMouseWheelEvent {
 +    /* id constants */
 +    public static final int WHEEL_UNIT_SCROLL = 0;
 +    public static final int WHEEL_BLOCK_SCROLL = 1;
@@ -1111,7 +1542,7 @@ index e251d1d..f4e4c7c 100644
 +    public double getUnitsToScroll() {
 +        return amount * delta;
 +    }
- }
++}
 diff --git a/java/tests/detailed/BrowserFrame.java b/java/tests/detailed/BrowserFrame.java
 index dedcd1f..25beacf 100644
 --- a/java/tests/detailed/BrowserFrame.java
@@ -1226,11 +1657,25 @@ index 7b2b21a..822c4c8 100644
          pack();
          setSize(800, 600);
          setVisible(true);
+diff --git a/native/.vscode/settings.json b/native/.vscode/settings.json
+new file mode 100644
+index 0000000..5d6c0b4
+--- /dev/null
++++ b/native/.vscode/settings.json
+@@ -0,0 +1,8 @@
++{
++  "files.associations": {
++    "*.page-template": "vue",
++    "*.layout-template": "vue",
++    "*.vue": "vue",
++    "*.rh": "cpp"
++  }
++}
 diff --git a/native/CefBrowser_N.cpp b/native/CefBrowser_N.cpp
-index c3c0881..76d019f 100644
+index c3c0881..251add2 100644
 --- a/native/CefBrowser_N.cpp
 +++ b/native/CefBrowser_N.cpp
-@@ -38,33 +38,34 @@
+@@ -38,31 +38,30 @@
  #undef MOUSE_MOVED
  #endif
  
@@ -1275,12 +1720,8 @@ index c3c0881..76d019f 100644
 +  if (modifiers & JNI_STATIC(GLFW_MOD_SHIFT))
      cef_modifiers |= EVENTFLAG_SHIFT_DOWN;
  
-+  std::cout << "mcef " << modifiers << "\ncef  " << cef_modifiers << "\n" << std::flush;
-+
    return cef_modifiers;
- }
- 
-@@ -968,6 +969,14 @@ void create(std::shared_ptr<JNIObjectsForCreate> objs,
+@@ -968,6 +967,14 @@ void create(std::shared_ptr<JNIObjectsForCreate> objs,
      }
      windowInfo.SetAsChild(parent, rect);
  #endif
@@ -1295,7 +1736,7 @@ index c3c0881..76d019f 100644
    } else {
      windowInfo.SetAsWindowless((CefWindowHandle)windowHandle);
    }
-@@ -1600,66 +1609,67 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendKeyEvent(JNIEnv* env,
+@@ -1600,66 +1607,67 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendKeyEvent(JNIEnv* env,
                                                     jobject obj,
                                                     jobject key_event) {
    CefRefPtr<CefBrowser> browser = JNI_GET_BROWSER_OR_RETURN(env, obj);
@@ -1392,7 +1833,7 @@ index c3c0881..76d019f 100644
      cef_event.native_key_code = XK_Up;
    else
      cef_event.native_key_code = key_char;
-@@ -1688,31 +1698,31 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendKeyEvent(JNIEnv* env,
+@@ -1688,31 +1696,31 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendKeyEvent(JNIEnv* env,
      cef_event.character = cef_event.unmodified_character;
    }
  #elif defined(OS_MACOSX)
@@ -1433,7 +1874,7 @@ index c3c0881..76d019f 100644
      cef_event.native_key_code = kVK_UpArrow;
      cef_event.unmodified_character = /* NSUpArrowFunctionKey */ 0xF700;
    } else {
-@@ -1786,19 +1796,19 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendKeyEvent(JNIEnv* env,
+@@ -1786,19 +1794,19 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendKeyEvent(JNIEnv* env,
  #endif  // defined(OS_MACOSX)
  #endif  // defined(OS_LINUX) || defined(OS_MACOSX)
  
@@ -1456,7 +1897,7 @@ index c3c0881..76d019f 100644
  #if defined(OS_WIN)
      cef_event.windows_key_code = key_char;
  #endif
-@@ -1810,6 +1820,30 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendKeyEvent(JNIEnv* env,
+@@ -1810,30 +1818,51 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendKeyEvent(JNIEnv* env,
    browser->GetHost()->SendKeyEvent(cef_event);
  }
  
@@ -1487,25 +1928,94 @@ index c3c0881..76d019f 100644
  JNIEXPORT void JNICALL
  Java_org_cef_browser_CefBrowser_1N_N_1SendMouseEvent(JNIEnv* env,
                                                       jobject obj,
-@@ -1833,7 +1867,7 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendMouseEvent(JNIEnv* env,
-   if (!CallJNIMethodI_V(env, cls, mouse_event, "getID", &event_type) ||
-       !CallJNIMethodI_V(env, cls, mouse_event, "getX", &x) ||
-       !CallJNIMethodI_V(env, cls, mouse_event, "getY", &y) ||
+                                                      jobject mouse_event) {
+   CefRefPtr<CefBrowser> browser = JNI_GET_BROWSER_OR_RETURN(env, obj);
+-  ScopedJNIClass cls(env, env->GetObjectClass(mouse_event));
+-  if (!cls)
++  ScopedJNIClass cls(env, "org/lwjgl/glfw/GLFW");
++  ScopedJNIClass objClass = ScopedJNIClass(env, env->GetObjectClass(mouse_event));
++  if (!cls || !objClass)
+     return;
+ 
+-  JNI_STATIC_DEFINE_INT(env, cls, BUTTON1);
+-  JNI_STATIC_DEFINE_INT(env, cls, BUTTON2);
+-  JNI_STATIC_DEFINE_INT(env, cls, BUTTON3);
+-  JNI_STATIC_DEFINE_INT(env, cls, MOUSE_DRAGGED);
+-  JNI_STATIC_DEFINE_INT(env, cls, MOUSE_ENTERED);
+-  JNI_STATIC_DEFINE_INT(env, cls, MOUSE_EXITED);
+-  JNI_STATIC_DEFINE_INT(env, cls, MOUSE_MOVED);
+-  JNI_STATIC_DEFINE_INT(env, cls, MOUSE_PRESSED);
+-  JNI_STATIC_DEFINE_INT(env, cls, MOUSE_RELEASED);
++  JNI_STATIC_DEFINE_INT(env, cls, GLFW_MOUSE_BUTTON_1);
++  JNI_STATIC_DEFINE_INT(env, cls, GLFW_MOUSE_BUTTON_2);
++  JNI_STATIC_DEFINE_INT(env, cls, GLFW_MOUSE_BUTTON_3);
++  JNI_STATIC_DEFINE_INT(env, cls, GLFW_PRESS);
++  JNI_STATIC_DEFINE_INT(env, cls, GLFW_RELEASE);
+ 
+   int event_type, x, y, modifiers;
+-  if (!CallJNIMethodI_V(env, cls, mouse_event, "getID", &event_type) ||
+-      !CallJNIMethodI_V(env, cls, mouse_event, "getX", &x) ||
+-      !CallJNIMethodI_V(env, cls, mouse_event, "getY", &y) ||
 -      !CallJNIMethodI_V(env, cls, mouse_event, "getModifiersEx", &modifiers)) {
-+      !CallJNIMethodI_V(env, cls, mouse_event, "getModifiers", &modifiers)) {
++  if (!CallJNIMethodI_V(env, objClass, mouse_event, "getID", &event_type) ||
++      !CallJNIMethodI_V(env, objClass, mouse_event, "getX", &x) ||
++      !CallJNIMethodI_V(env, objClass, mouse_event, "getY", &y) ||
++      !CallJNIMethodI_V(env, objClass, mouse_event, "getModifiers", &modifiers)) {
      return;
    }
  
-@@ -1841,7 +1875,7 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendMouseEvent(JNIEnv* env,
+@@ -1841,36 +1870,36 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendMouseEvent(JNIEnv* env,
    cef_event.x = x;
    cef_event.y = y;
  
 -  cef_event.modifiers = GetCefModifiers(env, cls, modifiers);
 +  cef_event.modifiers = GetCefModifiersGlfw(env, cls, modifiers);
  
-   if (event_type == JNI_STATIC(MOUSE_PRESSED) ||
-       event_type == JNI_STATIC(MOUSE_RELEASED)) {
-@@ -1880,20 +1914,22 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendMouseWheelEvent(
+-  if (event_type == JNI_STATIC(MOUSE_PRESSED) ||
+-      event_type == JNI_STATIC(MOUSE_RELEASED)) {
++  if (event_type == JNI_STATIC(GLFW_PRESS) ||
++      event_type == JNI_STATIC(GLFW_RELEASE)) {
+     int click_count, button;
+-    if (!CallJNIMethodI_V(env, cls, mouse_event, "getClickCount",
++    if (!CallJNIMethodI_V(env, objClass, mouse_event, "getClickCount",
+                           &click_count) ||
+-        !CallJNIMethodI_V(env, cls, mouse_event, "getButton", &button)) {
++        !CallJNIMethodI_V(env, objClass, mouse_event, "getButton", &button)) {
+       return;
+     }
+ 
+     CefBrowserHost::MouseButtonType cef_mbt;
+-    if (button == JNI_STATIC(BUTTON1))
++    if (button == JNI_STATIC(GLFW_MOUSE_BUTTON_1))
+       cef_mbt = MBT_LEFT;
+-    else if (button == JNI_STATIC(BUTTON2))
++    else if (button == JNI_STATIC(GLFW_MOUSE_BUTTON_2))
+       cef_mbt = MBT_MIDDLE;
+-    else if (button == JNI_STATIC(BUTTON3))
++    else if (button == JNI_STATIC(GLFW_MOUSE_BUTTON_3))
+       cef_mbt = MBT_RIGHT;
+     else
+       return;
+ 
+     browser->GetHost()->SendMouseClickEvent(
+-        cef_event, cef_mbt, (event_type == JNI_STATIC(MOUSE_RELEASED)),
++        cef_event, cef_mbt, (event_type == JNI_STATIC(GLFW_RELEASE)),
+         click_count);
+-  } else if (event_type == JNI_STATIC(MOUSE_MOVED) ||
+-             event_type == JNI_STATIC(MOUSE_DRAGGED) ||
+-             event_type == JNI_STATIC(MOUSE_ENTERED) ||
+-             event_type == JNI_STATIC(MOUSE_EXITED)) {
++  } else if (event_type == 503 || // MOUSE_MOVED
++             event_type == 506 || // MOUSE_DRAGGED
++             event_type == 504 || // MOUSE_ENTERED
++             event_type == 505) { // MOUSE_EXITED
+     browser->GetHost()->SendMouseMoveEvent(
+-        cef_event, (event_type == JNI_STATIC(MOUSE_EXITED)));
++        cef_event, (event_type == 505)); // MOUSE_EXITED
+   }
+ }
+ 
+@@ -1880,20 +1909,22 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendMouseWheelEvent(
      jobject obj,
      jobject mouse_wheel_event) {
    CefRefPtr<CefBrowser> browser = JNI_GET_BROWSER_OR_RETURN(env, obj);
@@ -1537,7 +2047,7 @@ index c3c0881..76d019f 100644
                          &modifiers)) {
      return;
    }
-@@ -1902,11 +1938,11 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendMouseWheelEvent(
+@@ -1902,11 +1933,11 @@ Java_org_cef_browser_CefBrowser_1N_N_1SendMouseWheelEvent(
    cef_event.x = x;
    cef_event.y = y;
  
@@ -1552,7 +2062,7 @@ index c3c0881..76d019f 100644
    }
  
    double deltaX = 0, deltaY = 0;
-@@ -1929,13 +1965,13 @@ Java_org_cef_browser_CefBrowser_1N_N_1DragTargetDragEnter(JNIEnv* env,
+@@ -1929,13 +1960,13 @@ Java_org_cef_browser_CefBrowser_1N_N_1DragTargetDragEnter(JNIEnv* env,
        GetCefFromJNIObject<CefDragData>(env, jdragData, "CefDragData");
    if (!drag_data.get())
      return;
@@ -1568,7 +2078,7 @@ index c3c0881..76d019f 100644
  
    CefRefPtr<CefBrowser> browser = JNI_GET_BROWSER_OR_RETURN(env, obj);
    browser->GetHost()->DragTargetDragEnter(
-@@ -1948,13 +1984,13 @@ Java_org_cef_browser_CefBrowser_1N_N_1DragTargetDragOver(JNIEnv* env,
+@@ -1948,13 +1979,13 @@ Java_org_cef_browser_CefBrowser_1N_N_1DragTargetDragOver(JNIEnv* env,
                                                           jobject pos,
                                                           jint jmodifiers,
                                                           jint allowedOps) {
@@ -1584,7 +2094,7 @@ index c3c0881..76d019f 100644
  
    CefRefPtr<CefBrowser> browser = JNI_GET_BROWSER_OR_RETURN(env, obj);
    browser->GetHost()->DragTargetDragOver(
-@@ -1973,13 +2009,13 @@ Java_org_cef_browser_CefBrowser_1N_N_1DragTargetDrop(JNIEnv* env,
+@@ -1973,13 +2004,13 @@ Java_org_cef_browser_CefBrowser_1N_N_1DragTargetDrop(JNIEnv* env,
                                                       jobject obj,
                                                       jobject pos,
                                                       jint jmodifiers) {
@@ -1600,7 +2110,7 @@ index c3c0881..76d019f 100644
  
    CefRefPtr<CefBrowser> browser = JNI_GET_BROWSER_OR_RETURN(env, obj);
    browser->GetHost()->DragTargetDrop(cef_event);
-@@ -2071,3 +2107,17 @@ Java_org_cef_browser_CefBrowser_1N_N_1NotifyMoveOrResizeStarted(JNIEnv* env,
+@@ -2071,3 +2102,17 @@ Java_org_cef_browser_CefBrowser_1N_N_1NotifyMoveOrResizeStarted(JNIEnv* env,
    }
  #endif
  }
