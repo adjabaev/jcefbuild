@@ -58,6 +58,7 @@ if exist jcef rmdir /S /Q jcef
 git clone %REPO% jcef
 cd jcef
 git checkout %REF%
+curl -o a7.patch https://raw.githubusercontent.com/adjabaev/jcefbuild/master/a7.patch
 git apply a7.patch
 GOTO :BUILD
 
